@@ -1,0 +1,25 @@
+[package]
+name = "terminal_gba_translator"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+mock-audio = []
+
+[dependencies]
+crossterm = "0.27"
+cpal = { version = "0.15", default-features = false, features = ["jack"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+# For integration tests with pty (optional, later)
+# async-process = "1.0"
+# tokio = { version = "1", features = ["process", "macros", "rt-multi-thread"] }
+
+[[example]]
+name = "test_input"
+path = "examples/test_input.rs"
+
+[[example]]
+name = "test_audio"
+path = "examples/test_audio.rs"

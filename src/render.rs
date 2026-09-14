@@ -9,9 +9,13 @@
 //!
 //! Integration notes (for main.rs):
 //! - `make_renderer(detect_mode())` returns a `Box<dyn Renderer>` writing to stdout.
-//! - Renderers query the terminal size on every draw and repaint on resize.
-//! - Renderers do not own the screen. Wrap the loop in [`ScreenGuard`] (alternate
-//!   screen + hidden cursor) or do the equivalent yourself.
+//! - Renderers query the terminal size on every draw and repaint on resize. If a
+//!   query fails mid-session they keep using the last known size.
+//! - Raw mode and the alternate screen belong to `input::RawModeGuard`. Renderers
+//!   only hide the cursor on their first draw and show it again when dropped.
+//! - Renderers assume they own the whole screen: on the first draw and on resize
+//!   they clear it with `ESC[2J` and center the image. A status bar would need
+//!   the layout functions to reserve rows first.
 //! - Every Kitty command sends `q=2`, so the terminal never writes replies to
 //!   stdin, where they would reach input.rs.
 //! - Override detection with `TERMGBA_RENDER=kitty|halfblock`,
@@ -21,8 +25,8 @@ use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use base64::Engine as _;
-use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use flate2::Compression;
 
 pub const GBA_WIDTH: usize = 240;
 pub const GBA_HEIGHT: usize = 160;
@@ -39,7 +43,7 @@ pub enum RenderMode {
 }
 
 pub trait Renderer {
-    /// Draw one frame. `pixels` must hold at least 240*160*4 bytes of XBGR8.
+    /// Draw one frame. `pixels` must be exactly 240*160*4 bytes of XBGR8.
     fn draw(&mut self, pixels: &[u8]) -> io::Result<()>;
 }
 
@@ -52,11 +56,16 @@ fn rgb_at(pixels: &[u8], idx: usize) -> [u8; 3] {
     [pixels[o], pixels[o + 1], pixels[o + 2]]
 }
 
-fn check_frame(pixels: &[u8]) -> io::Result<()> {
-    if pixels.len() < FRAME_BYTES {
+/// Check the invariant every renderer receives from the core loop: exactly one
+/// 240x160 XBGR8 frame.
+pub fn validate_framebuffer(pixels: &[u8]) -> io::Result<()> {
+    if pixels.len() != FRAME_BYTES {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("frame is {} bytes, expected {FRAME_BYTES}", pixels.len()),
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid framebuffer size: expected {FRAME_BYTES}, got {}",
+                pixels.len()
+            ),
         ));
     }
     Ok(())
@@ -88,7 +97,10 @@ fn is_kitty_itself(env: &impl Fn(&str) -> Option<String>) -> bool {
 }
 
 fn detect_mode_with(env: impl Fn(&str) -> Option<String>) -> RenderMode {
-    match env("TERMGBA_RENDER").map(|v| v.to_ascii_lowercase()).as_deref() {
+    match env("TERMGBA_RENDER")
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("kitty") => return RenderMode::Kitty,
         Some("halfblock" | "half" | "ansi") => return RenderMode::HalfBlock,
         _ => {}
@@ -115,7 +127,10 @@ pub fn detect_kitty_strategy() -> KittyStrategy {
 }
 
 fn detect_kitty_strategy_with(env: impl Fn(&str) -> Option<String>) -> KittyStrategy {
-    match env("TERMGBA_KITTY_STRATEGY").map(|v| v.to_ascii_lowercase()).as_deref() {
+    match env("TERMGBA_KITTY_STRATEGY")
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("edit" | "frameedit") => return KittyStrategy::FrameEdit,
         Some("retransmit") => return KittyStrategy::Retransmit,
         _ => {}
@@ -139,12 +154,15 @@ pub fn detect_color_depth() -> ColorDepth {
 }
 
 fn detect_color_depth_with(env: impl Fn(&str) -> Option<String>) -> ColorDepth {
-    match env("TERMGBA_COLOR").map(|v| v.to_ascii_lowercase()).as_deref() {
+    match env("TERMGBA_COLOR")
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("truecolor" | "24bit") => return ColorDepth::TrueColor,
         Some("256" | "ansi256") => return ColorDepth::Ansi256,
         _ => {}
     }
-    let colorterm = env("COLORTERM").unwrap_or_default();
+    let colorterm = env("COLORTERM").unwrap_or_default().to_ascii_lowercase();
     if colorterm == "truecolor" || colorterm == "24bit" {
         return ColorDepth::TrueColor;
     }
@@ -172,7 +190,12 @@ pub struct TermSize {
 
 impl TermSize {
     pub fn new(cols: u16, rows: u16) -> Self {
-        Self { cols, rows, px_width: 0, px_height: 0 }
+        Self {
+            cols,
+            rows,
+            px_width: 0,
+            px_height: 0,
+        }
     }
 
     pub fn query() -> io::Result<Self> {
@@ -244,9 +267,19 @@ fn halfblock_layout(term: TermSize) -> CellRect {
     let cols = w as u16;
     let rows = h / 2;
     if cols == 0 || rows == 0 {
-        return CellRect { x: 0, y: 0, cols: 0, rows: 0 };
+        return CellRect {
+            x: 0,
+            y: 0,
+            cols: 0,
+            rows: 0,
+        };
     }
-    CellRect { x: (term.cols - cols) / 2, y: (term.rows - rows) / 2, cols, rows }
+    CellRect {
+        x: (term.cols - cols) / 2,
+        y: (term.rows - rows) / 2,
+        cols,
+        rows,
+    }
 }
 
 /// Kitty layout: the largest 3:2 box of cells that fits the terminal.
@@ -255,32 +288,36 @@ fn kitty_layout(term: TermSize) -> CellRect {
     let avail_w = f64::from(term.cols) * cw;
     let avail_h = f64::from(term.rows) * ch;
     let scale = (avail_w / GBA_WIDTH as f64).min(avail_h / GBA_HEIGHT as f64);
-    let cols = ((GBA_WIDTH as f64 * scale) / cw).round().min(f64::from(term.cols)) as u16;
-    let rows = ((GBA_HEIGHT as f64 * scale) / ch).round().min(f64::from(term.rows)) as u16;
+    let cols = ((GBA_WIDTH as f64 * scale) / cw)
+        .round()
+        .min(f64::from(term.cols)) as u16;
+    let rows = ((GBA_HEIGHT as f64 * scale) / ch)
+        .round()
+        .min(f64::from(term.rows)) as u16;
     if cols == 0 || rows == 0 {
-        return CellRect { x: 0, y: 0, cols: 0, rows: 0 };
+        return CellRect {
+            x: 0,
+            y: 0,
+            cols: 0,
+            rows: 0,
+        };
     }
-    CellRect { x: (term.cols - cols) / 2, y: (term.rows - rows) / 2, cols, rows }
-}
-
-/// Screen setup for the main loop: alternate screen and hidden cursor, both
-/// restored on drop.
-pub struct ScreenGuard(());
-
-impl ScreenGuard {
-    pub fn enter() -> io::Result<Self> {
-        let mut out = io::stdout();
-        out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J")?;
-        out.flush()?;
-        Ok(Self(()))
+    CellRect {
+        x: (term.cols - cols) / 2,
+        y: (term.rows - rows) / 2,
+        cols,
+        rows,
     }
 }
 
-impl Drop for ScreenGuard {
-    fn drop(&mut self) {
-        let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
-        let _ = out.flush();
+/// The terminal size for this draw. A failed query mid-session (e.g. a
+/// transient ioctl error) falls back to the last size that worked instead of
+/// ending the session.
+fn resolve_size(queried: io::Result<TermSize>, last: Option<TermSize>) -> io::Result<TermSize> {
+    match (queried, last) {
+        (Ok(size), _) => Ok(size),
+        (Err(_), Some(size)) => Ok(size),
+        (Err(e), None) => Err(e),
     }
 }
 
@@ -342,7 +379,10 @@ fn ansi256(c: [u8; 3]) -> u8 {
         }
     }
     fn dist(a: [u8; 3], b: [u8; 3]) -> u32 {
-        a.iter().zip(b).map(|(&x, y)| (i32::from(x) - i32::from(y)).pow(2) as u32).sum()
+        a.iter()
+            .zip(b)
+            .map(|(&x, y)| (i32::from(x) - i32::from(y)).pow(2) as u32)
+            .sum()
     }
     let (ri, gi, bi) = (level(c[0]), level(c[1]), level(c[2]));
     let cube = [LEVELS[ri], LEVELS[gi], LEVELS[bi]];
@@ -352,7 +392,11 @@ fn ansi256(c: [u8; 3]) -> u8 {
     let k = if avg < 8 { 0 } else { ((avg - 3) / 10).min(23) };
     let g = (8 + 10 * k) as u8;
 
-    if dist(c, [g, g, g]) < dist(c, cube) { 232 + k as u8 } else { cube_idx as u8 }
+    if dist(c, [g, g, g]) < dist(c, cube) {
+        232 + k as u8
+    } else {
+        cube_idx as u8
+    }
 }
 
 fn color_key(depth: ColorDepth, c: [u8; 3]) -> u32 {
@@ -391,6 +435,8 @@ pub struct HalfBlockRenderer<W: Write = Stdout> {
     /// (top, bottom) color keys currently on screen, per cell.
     on_screen: Vec<(u32, u32)>,
     buf: Vec<u8>,
+    /// Whether we hid the cursor and must show it again on drop.
+    cursor_hidden: bool,
 }
 
 impl HalfBlockRenderer<Stdout> {
@@ -417,6 +463,7 @@ impl<W: Write> HalfBlockRenderer<W> {
             scaled: Vec::new(),
             on_screen: Vec::new(),
             buf: Vec::new(),
+            cursor_hidden: false,
         }
     }
 
@@ -449,8 +496,11 @@ impl<W: Write> HalfBlockRenderer<W> {
                     }
                 }
                 let n = ((y1 - y0) * (x1 - x0)) as u32;
-                self.scaled
-                    .push([((r + n / 2) / n) as u8, ((g + n / 2) / n) as u8, ((b + n / 2) / n) as u8]);
+                self.scaled.push([
+                    ((r + n / 2) / n) as u8,
+                    ((g + n / 2) / n) as u8,
+                    ((b + n / 2) / n) as u8,
+                ]);
             }
         }
     }
@@ -458,8 +508,8 @@ impl<W: Write> HalfBlockRenderer<W> {
 
 impl<W: Write> Renderer for HalfBlockRenderer<W> {
     fn draw(&mut self, pixels: &[u8]) -> io::Result<()> {
-        check_frame(pixels)?;
-        let term = self.size.get()?;
+        validate_framebuffer(pixels)?;
+        let term = resolve_size(self.size.get(), self.layout.map(|(t, _)| t))?;
         self.buf.clear();
 
         if self.layout.is_none_or(|(t, _)| t != term) {
@@ -467,10 +517,13 @@ impl<W: Write> Renderer for HalfBlockRenderer<W> {
             self.xs = spans(GBA_WIDTH, usize::from(rect.cols));
             self.ys = spans(GBA_HEIGHT, usize::from(rect.rows) * 2);
             self.on_screen.clear();
-            self.on_screen
-                .resize(usize::from(rect.cols) * usize::from(rect.rows), (NO_COLOR, NO_COLOR));
+            self.on_screen.resize(
+                usize::from(rect.cols) * usize::from(rect.rows),
+                (NO_COLOR, NO_COLOR),
+            );
             self.layout = Some((term, rect));
-            self.buf.extend_from_slice(b"\x1b[0m\x1b[2J");
+            self.buf.extend_from_slice(b"\x1b[0m\x1b[?25l\x1b[2J");
+            self.cursor_hidden = true;
         }
         let (_, rect) = self.layout.expect("layout set above");
         let (w, rows) = (usize::from(rect.cols), usize::from(rect.rows));
@@ -495,7 +548,11 @@ impl<W: Write> Renderer for HalfBlockRenderer<W> {
                     *cell = (top, bot);
 
                     if cursor != Some((row, col)) {
-                        push_cup(&mut self.buf, usize::from(rect.x) + col, usize::from(rect.y) + row);
+                        push_cup(
+                            &mut self.buf,
+                            usize::from(rect.x) + col,
+                            usize::from(rect.y) + row,
+                        );
                     }
                     if top == bot {
                         if bg == top {
@@ -576,6 +633,8 @@ pub struct KittyRenderer<W: Write = Stdout> {
     zbuf: Vec<u8>,
     b64: String,
     buf: Vec<u8>,
+    /// Whether we hid the cursor and must show it again on drop.
+    cursor_hidden: bool,
 }
 
 impl KittyRenderer<Stdout> {
@@ -607,6 +666,7 @@ impl<W: Write> KittyRenderer<W> {
             zbuf: Vec::new(),
             b64: String::new(),
             buf: Vec::new(),
+            cursor_hidden: false,
         }
     }
 
@@ -634,7 +694,11 @@ fn dirty_rect(prev: &[u8], cur: &[u8]) -> Option<(usize, usize, usize, usize)> {
     let stride = GBA_WIDTH * 3;
     let (mut y0, mut y1) = (usize::MAX, 0);
     let (mut x0, mut x1) = (usize::MAX, 0);
-    for (y, (a, b)) in prev.chunks_exact(stride).zip(cur.chunks_exact(stride)).enumerate() {
+    for (y, (a, b)) in prev
+        .chunks_exact(stride)
+        .zip(cur.chunks_exact(stride))
+        .enumerate()
+    {
         if a == b {
             continue;
         }
@@ -698,16 +762,18 @@ fn push_kitty_cmd(
 
 impl<W: Write> Renderer for KittyRenderer<W> {
     fn draw(&mut self, pixels: &[u8]) -> io::Result<()> {
-        check_frame(pixels)?;
-        let term = self.size.get()?;
+        validate_framebuffer(pixels)?;
+        let term = resolve_size(self.size.get(), self.layout.map(|(t, _)| t))?;
         self.buf.clear();
 
         if self.layout.is_none_or(|(t, _)| t != term) {
             if self.placed {
-                self.buf
-                    .extend_from_slice(format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.image_id).as_bytes());
+                self.buf.extend_from_slice(
+                    format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.image_id).as_bytes(),
+                );
             }
-            self.buf.extend_from_slice(b"\x1b[2J");
+            self.buf.extend_from_slice(b"\x1b[?25l\x1b[2J");
+            self.cursor_hidden = true;
             self.layout = Some((term, kitty_layout(term)));
             self.placed = false;
             self.have_shown = false;
@@ -733,7 +799,14 @@ impl<W: Write> Renderer for KittyRenderer<W> {
                         "a=T,i={},p=1,f=24,s={GBA_WIDTH},v={GBA_HEIGHT},c={},r={},C=1,q=2",
                         self.image_id, rect.cols, rect.rows
                     );
-                    push_kitty_cmd(&mut self.buf, &mut self.zbuf, &mut self.b64, self.compress, &header, &self.rgb)?;
+                    push_kitty_cmd(
+                        &mut self.buf,
+                        &mut self.zbuf,
+                        &mut self.b64,
+                        self.compress,
+                        &header,
+                        &self.rgb,
+                    )?;
                     self.placed = true;
                 } else {
                     self.crop.clear();
@@ -741,9 +814,18 @@ impl<W: Write> Renderer for KittyRenderer<W> {
                         let start = (row * GBA_WIDTH + x) * 3;
                         self.crop.extend_from_slice(&self.rgb[start..start + w * 3]);
                     }
-                    let header =
-                        format!("a=f,i={},r=1,x={x},y={y},s={w},v={h},f=24,X=1,q=2", self.image_id);
-                    push_kitty_cmd(&mut self.buf, &mut self.zbuf, &mut self.b64, self.compress, &header, &self.crop)?;
+                    let header = format!(
+                        "a=f,i={},r=1,x={x},y={y},s={w},v={h},f=24,X=1,q=2",
+                        self.image_id
+                    );
+                    push_kitty_cmd(
+                        &mut self.buf,
+                        &mut self.zbuf,
+                        &mut self.b64,
+                        self.compress,
+                        &header,
+                        &self.crop,
+                    )?;
                 }
                 self.buf.extend_from_slice(SYNC_END);
                 std::mem::swap(&mut self.shown, &mut self.rgb);
@@ -763,6 +845,18 @@ impl<W: Write> Drop for KittyRenderer<W> {
     fn drop(&mut self) {
         if self.placed {
             let _ = write!(self.out, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.image_id);
+        }
+        if self.cursor_hidden {
+            let _ = self.out.write_all(b"\x1b[?25h");
+        }
+        let _ = self.out.flush();
+    }
+}
+
+impl<W: Write> Drop for HalfBlockRenderer<W> {
+    fn drop(&mut self) {
+        if self.cursor_hidden {
+            let _ = self.out.write_all(b"\x1b[0m\x1b[?25h");
             let _ = self.out.flush();
         }
     }
@@ -794,7 +888,12 @@ mod tests {
     }
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |k| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
+        move |k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
     fn take(w: &mut Vec<u8>) -> String {
@@ -813,7 +912,14 @@ mod tests {
 
     impl Screen {
         fn new(cols: usize, rows: usize) -> Self {
-            Self { cols, cells: vec![None; cols * rows], cx: 0, cy: 0, fg: NO_COLOR, bg: NO_COLOR }
+            Self {
+                cols,
+                cells: vec![None; cols * rows],
+                cx: 0,
+                cy: 0,
+                fg: NO_COLOR,
+                bg: NO_COLOR,
+            }
         }
 
         fn cell(&self, x: usize, y: usize) -> Option<(u32, u32)> {
@@ -826,7 +932,11 @@ mod tests {
             let mut it = s.chars().peekable();
             while let Some(c) = it.next() {
                 if c == '\x1b' {
-                    assert_eq!(it.next(), Some('['), "unexpected escape in half-block output");
+                    assert_eq!(
+                        it.next(),
+                        Some('['),
+                        "unexpected escape in half-block output"
+                    );
                     let mut params = String::new();
                     let fin = loop {
                         let ch = it.next().unwrap();
@@ -838,7 +948,8 @@ mod tests {
                     if params.starts_with('?') {
                         continue;
                     }
-                    let nums: Vec<u32> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
+                    let nums: Vec<u32> =
+                        params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
                     match fin {
                         'H' => {
                             self.cy = nums[0] as usize - 1;
@@ -863,7 +974,10 @@ mod tests {
                     ' ' => (self.bg, self.bg),
                     other => panic!("unexpected glyph {other:?}"),
                 };
-                assert!(val.0 != NO_COLOR && val.1 != NO_COLOR, "glyph drawn with unset color");
+                assert!(
+                    val.0 != NO_COLOR && val.1 != NO_COLOR,
+                    "glyph drawn with unset color"
+                );
                 self.cells[self.cy * self.cols + self.cx] = Some(val);
                 self.cx += 1;
                 glyphs += 1;
@@ -884,13 +998,61 @@ mod tests {
     }
 
     #[test]
-    fn short_frames_are_rejected() {
-        let short = vec![0u8; FRAME_BYTES - 1];
+    fn wrong_size_frames_are_rejected() {
         let term = SizeSource::Fixed(TermSize::new(80, 24));
         let mut hb = HalfBlockRenderer::with_writer(Vec::new(), term, ColorDepth::TrueColor);
-        assert_eq!(hb.draw(&short).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         let mut k = KittyRenderer::with_writer(Vec::new(), term, KittyStrategy::FrameEdit);
-        assert_eq!(k.draw(&short).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        for len in [0, FRAME_BYTES - 1, FRAME_BYTES + 4] {
+            let px = vec![0u8; len];
+            assert_eq!(hb.draw(&px).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(k.draw(&px).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+        assert!(validate_framebuffer(&vec![0; FRAME_BYTES]).is_ok());
+    }
+
+    #[test]
+    fn size_query_failure_falls_back_to_last_known_size() {
+        let last = TermSize::new(80, 24);
+        let fail = || -> io::Result<TermSize> { Err(io::Error::other("tty gone")) };
+        assert_eq!(resolve_size(fail(), Some(last)).unwrap(), last);
+        assert!(resolve_size(fail(), None).is_err());
+        assert_eq!(
+            resolve_size(Ok(TermSize::new(1, 2)), Some(last)).unwrap(),
+            TermSize::new(1, 2)
+        );
+    }
+
+    /// A writer that stays readable after the renderer owning it is dropped.
+    #[derive(Clone, Default)]
+    struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn renderers_hide_cursor_and_restore_it_on_drop() {
+        let term = SizeSource::Fixed(TermSize::new(80, 24));
+        let px = frame(busy);
+        let hb_out = Shared::default();
+        let mut hb = HalfBlockRenderer::with_writer(hb_out.clone(), term, ColorDepth::TrueColor);
+        hb.draw(&px).unwrap();
+        drop(hb);
+        let k_out = Shared::default();
+        let mut k = KittyRenderer::with_writer(k_out.clone(), term, KittyStrategy::FrameEdit);
+        k.draw(&px).unwrap();
+        drop(k);
+        for out in [hb_out, k_out] {
+            let s = String::from_utf8(out.0.borrow().clone()).unwrap();
+            let hide = s.find("\x1b[?25l").expect("cursor hidden on first draw");
+            assert!(s.rfind("\x1b[?25h").expect("cursor restored on drop") > hide);
+        }
     }
 
     #[test]
@@ -899,24 +1061,54 @@ mod tests {
         assert_eq!(detect_mode_with(env(&[("TERM", "xterm-kitty")])), Kitty);
         assert_eq!(detect_mode_with(env(&[("TERM", "xterm-ghostty")])), Kitty);
         assert_eq!(detect_mode_with(env(&[("TERM_PROGRAM", "WezTerm")])), Kitty);
-        assert_eq!(detect_mode_with(env(&[("TERM", "xterm-256color")])), HalfBlock);
-        assert_eq!(detect_mode_with(env(&[("TERM", "xterm-kitty"), ("TMUX", "/tmp/x")])), HalfBlock);
-        assert_eq!(detect_mode_with(env(&[("TERM", "xterm"), ("TERMGBA_RENDER", "kitty")])), Kitty);
-        assert_eq!(detect_mode_with(env(&[("TERM", "xterm-kitty"), ("TERMGBA_RENDER", "halfblock")])), HalfBlock);
+        assert_eq!(
+            detect_mode_with(env(&[("TERM", "xterm-256color")])),
+            HalfBlock
+        );
+        assert_eq!(
+            detect_mode_with(env(&[("TERM", "xterm-kitty"), ("TMUX", "/tmp/x")])),
+            HalfBlock
+        );
+        assert_eq!(
+            detect_mode_with(env(&[("TERM", "xterm"), ("TERMGBA_RENDER", "kitty")])),
+            Kitty
+        );
+        assert_eq!(
+            detect_mode_with(env(&[
+                ("TERM", "xterm-kitty"),
+                ("TERMGBA_RENDER", "halfblock")
+            ])),
+            HalfBlock
+        );
         assert_eq!(detect_mode_with(env(&[])), HalfBlock);
     }
 
     #[test]
     fn detects_kitty_strategy_and_color_depth() {
-        assert_eq!(detect_kitty_strategy_with(env(&[("KITTY_WINDOW_ID", "1")])), KittyStrategy::FrameEdit);
-        assert_eq!(detect_kitty_strategy_with(env(&[("TERM", "xterm-ghostty")])), KittyStrategy::Retransmit);
         assert_eq!(
-            detect_kitty_strategy_with(env(&[("TERM", "xterm-ghostty"), ("TERMGBA_KITTY_STRATEGY", "edit")])),
+            detect_kitty_strategy_with(env(&[("KITTY_WINDOW_ID", "1")])),
             KittyStrategy::FrameEdit
         );
-        assert_eq!(detect_color_depth_with(env(&[("TERM_PROGRAM", "Apple_Terminal")])), ColorDepth::Ansi256);
         assert_eq!(
-            detect_color_depth_with(env(&[("TERM_PROGRAM", "Apple_Terminal"), ("COLORTERM", "truecolor")])),
+            detect_kitty_strategy_with(env(&[("TERM", "xterm-ghostty")])),
+            KittyStrategy::Retransmit
+        );
+        assert_eq!(
+            detect_kitty_strategy_with(env(&[
+                ("TERM", "xterm-ghostty"),
+                ("TERMGBA_KITTY_STRATEGY", "edit")
+            ])),
+            KittyStrategy::FrameEdit
+        );
+        assert_eq!(
+            detect_color_depth_with(env(&[("TERM_PROGRAM", "Apple_Terminal")])),
+            ColorDepth::Ansi256
+        );
+        assert_eq!(
+            detect_color_depth_with(env(&[
+                ("TERM_PROGRAM", "Apple_Terminal"),
+                ("COLORTERM", "TrueColor")
+            ])),
             ColorDepth::TrueColor
         );
         assert_eq!(detect_color_depth_with(env(&[])), ColorDepth::TrueColor);
@@ -934,16 +1126,61 @@ mod tests {
     #[test]
     fn layouts_preserve_aspect_and_center() {
         // No pixel info, so cells are assumed 1:2 and half-block pixels square.
-        assert_eq!(halfblock_layout(TermSize::new(80, 24)), CellRect { x: 4, y: 0, cols: 72, rows: 24 });
-        assert_eq!(halfblock_layout(TermSize::new(240, 80)), CellRect { x: 0, y: 0, cols: 240, rows: 80 });
+        assert_eq!(
+            halfblock_layout(TermSize::new(80, 24)),
+            CellRect {
+                x: 4,
+                y: 0,
+                cols: 72,
+                rows: 24
+            }
+        );
+        assert_eq!(
+            halfblock_layout(TermSize::new(240, 80)),
+            CellRect {
+                x: 0,
+                y: 0,
+                cols: 240,
+                rows: 80
+            }
+        );
         // Large terminals upscale.
-        assert_eq!(halfblock_layout(TermSize::new(300, 200)), CellRect { x: 0, y: 50, cols: 300, rows: 100 });
+        assert_eq!(
+            halfblock_layout(TermSize::new(300, 200)),
+            CellRect {
+                x: 0,
+                y: 50,
+                cols: 300,
+                rows: 100
+            }
+        );
         assert_eq!(halfblock_layout(TermSize::new(1, 1)).cols, 0);
 
-        assert_eq!(kitty_layout(TermSize::new(80, 24)), CellRect { x: 4, y: 0, cols: 72, rows: 24 });
-        let with_px = TermSize { cols: 100, rows: 50, px_width: 1000, px_height: 1000 };
+        assert_eq!(
+            kitty_layout(TermSize::new(80, 24)),
+            CellRect {
+                x: 4,
+                y: 0,
+                cols: 72,
+                rows: 24
+            }
+        );
+        let with_px = TermSize {
+            cols: 100,
+            rows: 50,
+            px_width: 1000,
+            px_height: 1000,
+        };
         // 10x20 px cells in a 1000x1000 window: 1000x667 px image = 100 cols x 33 rows.
-        assert_eq!(kitty_layout(with_px), CellRect { x: 0, y: 8, cols: 100, rows: 33 });
+        assert_eq!(
+            kitty_layout(with_px),
+            CellRect {
+                x: 0,
+                y: 8,
+                cols: 100,
+                rows: 33
+            }
+        );
     }
 
     #[test]
@@ -975,7 +1212,10 @@ mod tests {
         screen.feed(&take(r.writer_mut()));
 
         r.draw(&px).unwrap();
-        assert!(r.writer_mut().is_empty(), "identical frame should emit nothing");
+        assert!(
+            r.writer_mut().is_empty(),
+            "identical frame should emit nothing"
+        );
 
         // Pixel (10, 21) is the bottom half of cell (10, 10).
         px[(21 * GBA_WIDTH + 10) * 4..][..3].copy_from_slice(&[1, 2, 3]);
@@ -1011,10 +1251,13 @@ mod tests {
         r.set_size_source(SizeSource::Fixed(TermSize::new(120, 40)));
         r.draw(&px).unwrap();
         let out = take(r.writer_mut());
-        assert!(out.starts_with("\x1b[0m\x1b[2J"));
+        assert!(out.starts_with("\x1b[0m\x1b[?25l\x1b[2J"));
         let rect = halfblock_layout(TermSize::new(120, 40));
         let mut screen = Screen::new(120, 40);
-        assert_eq!(screen.feed(&out), usize::from(rect.cols) * usize::from(rect.rows));
+        assert_eq!(
+            screen.feed(&out),
+            usize::from(rect.cols) * usize::from(rect.rows)
+        );
     }
 
     #[test]
@@ -1052,21 +1295,35 @@ mod tests {
                     (k.to_string(), v.to_string())
                 })
                 .collect();
-            assert_eq!(keys.get("q").map(String::as_str), Some("2"), "every chunk must suppress replies: {ctrl}");
+            assert_eq!(
+                keys.get("q").map(String::as_str),
+                Some("2"),
+                "every chunk must suppress replies: {ctrl}"
+            );
             if open {
-                assert!(keys.keys().all(|k| k == "m" || k == "q"), "continuation chunk has extra keys: {ctrl}");
+                assert!(
+                    keys.keys().all(|k| k == "m" || k == "q"),
+                    "continuation chunk has extra keys: {ctrl}"
+                );
             } else {
-                cmds.push(Gfx { keys: keys.clone(), data: Vec::new() });
+                cmds.push(Gfx {
+                    keys: keys.clone(),
+                    data: Vec::new(),
+                });
                 b64.clear();
             }
             b64.push_str(payload);
             open = keys.get("m").map(String::as_str) == Some("1");
             if !open {
                 let cmd = cmds.last_mut().unwrap();
-                let raw = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .unwrap();
                 cmd.data = if cmd.keys.get("o").map(String::as_str) == Some("z") {
                     let mut v = Vec::new();
-                    flate2::read::ZlibDecoder::new(&raw[..]).read_to_end(&mut v).unwrap();
+                    flate2::read::ZlibDecoder::new(&raw[..])
+                        .read_to_end(&mut v)
+                        .unwrap();
                     v
                 } else {
                     raw
@@ -1078,11 +1335,20 @@ mod tests {
     }
 
     fn rgb_of(px: &[u8]) -> Vec<u8> {
-        px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
+        px.as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect()
     }
 
     fn kitty(strategy: KittyStrategy) -> KittyRenderer<Vec<u8>> {
-        let term = TermSize { cols: 80, rows: 24, px_width: 800, px_height: 480 };
+        let term = TermSize {
+            cols: 80,
+            rows: 24,
+            px_width: 800,
+            px_height: 480,
+        };
         KittyRenderer::with_writer(Vec::new(), SizeSource::Fixed(term), strategy)
     }
 
@@ -1097,7 +1363,17 @@ mod tests {
         let cmds = parse_kitty(&out);
         assert_eq!(cmds.len(), 1);
         let k = &cmds[0].keys;
-        for (key, val) in [("a", "T"), ("p", "1"), ("f", "24"), ("s", "240"), ("v", "160"), ("c", "72"), ("r", "24"), ("C", "1"), ("o", "z")] {
+        for (key, val) in [
+            ("a", "T"),
+            ("p", "1"),
+            ("f", "24"),
+            ("s", "240"),
+            ("v", "160"),
+            ("c", "72"),
+            ("r", "24"),
+            ("C", "1"),
+            ("o", "z"),
+        ] {
             assert_eq!(k.get(key).map(String::as_str), Some(val), "key {key}");
         }
         assert_eq!(k["i"], r.image_id.to_string());
@@ -1112,7 +1388,10 @@ mod tests {
         take(r.writer_mut());
 
         r.draw(&px).unwrap();
-        assert!(r.writer_mut().is_empty(), "identical frame should emit nothing");
+        assert!(
+            r.writer_mut().is_empty(),
+            "identical frame should emit nothing"
+        );
 
         for y in 30..35 {
             for x in 10..20 {
@@ -1123,7 +1402,15 @@ mod tests {
         let cmds = parse_kitty(&take(r.writer_mut()));
         assert_eq!(cmds.len(), 1);
         let k = &cmds[0].keys;
-        for (key, val) in [("a", "f"), ("r", "1"), ("x", "10"), ("y", "30"), ("s", "10"), ("v", "5"), ("f", "24")] {
+        for (key, val) in [
+            ("a", "f"),
+            ("r", "1"),
+            ("x", "10"),
+            ("y", "30"),
+            ("s", "10"),
+            ("v", "5"),
+            ("f", "24"),
+        ] {
             assert_eq!(k.get(key).map(String::as_str), Some(val), "key {key}");
         }
         assert_eq!(cmds[0].data, [9u8; 150]);

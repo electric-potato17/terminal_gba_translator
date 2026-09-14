@@ -6,20 +6,17 @@
 //!   cargo run --release --bin render_demo -- --ppm f.ppm   # show a 240x160 P6 dump from emu.rs
 //!   cargo run --release --bin render_demo -- --bench       # headless throughput table, no tty needed
 
-#[allow(dead_code)]
-#[path = "../render.rs"]
-mod render;
-
 use std::cell::Cell;
 use std::io::{self, Write};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use render::{
-    ColorDepth, FRAME_BYTES, GBA_HEIGHT, GBA_WIDTH, HalfBlockRenderer, KittyRenderer, KittyStrategy, RenderMode,
-    Renderer, ScreenGuard, SizeSource, TermSize,
+use terminal_gba_translator::render::{
+    self, ColorDepth, HalfBlockRenderer, KittyRenderer, KittyStrategy, RenderMode, Renderer,
+    SizeSource, TermSize, FRAME_BYTES, GBA_HEIGHT, GBA_WIDTH,
 };
+use terminal_gba_translator::RawModeGuard;
 
 const USAGE: &str = "\
 render_demo: exercise termgba's renderers without an emulator
@@ -53,7 +50,13 @@ enum Pattern {
     Image,
 }
 
-const SYNTHETIC: [Pattern; 5] = [Pattern::Bars, Pattern::Checker, Pattern::Gradient, Pattern::Sprite, Pattern::Noise];
+const SYNTHETIC: [Pattern; 5] = [
+    Pattern::Bars,
+    Pattern::Checker,
+    Pattern::Gradient,
+    Pattern::Sprite,
+    Pattern::Noise,
+];
 
 struct Opts {
     mode: Option<RenderMode>,
@@ -76,7 +79,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let result = if opts.bench { run_bench(&opts) } else { run_interactive(opts) };
+    let result = if opts.bench {
+        run_bench(&opts)
+    } else {
+        run_interactive(opts)
+    };
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -94,7 +101,12 @@ fn parse_args() -> Result<Opts, String> {
         fps: 59.7275,
         frames: None,
         bench: false,
-        size: TermSize { cols: 160, rows: 50, px_width: 1600, px_height: 1000 },
+        size: TermSize {
+            cols: 160,
+            rows: 50,
+            px_width: 1600,
+            px_height: 1000,
+        },
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -147,7 +159,9 @@ fn parse_args() -> Result<Opts, String> {
             "--fps" => o.fps = val()?.parse().map_err(|_| "bad --fps")?,
             "--frames" => o.frames = Some(val()?.parse().map_err(|_| "bad --frames")?),
             "--bench" => o.bench = true,
-            "--size" => o.size = parse_size(&val()?).ok_or("bad --size, expected e.g. 160x50@1600x1000")?,
+            "--size" => {
+                o.size = parse_size(&val()?).ok_or("bad --size, expected e.g. 160x50@1600x1000")?
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -171,7 +185,12 @@ fn parse_size(s: &str) -> Option<TermSize> {
         Some(p) => pair(p)?,
         None => (0, 0),
     };
-    Some(TermSize { cols, rows, px_width, px_height })
+    Some(TermSize {
+        cols,
+        rows,
+        px_width,
+        px_height,
+    })
 }
 
 /// Loads a 240x160 binary PPM as an XBGR8 frame (R, G, B, X byte order).
@@ -204,11 +223,28 @@ fn load_ppm(path: &str) -> io::Result<Vec<u8>> {
         return Err(bad("not a binary PPM (P6)"));
     }
     if w != GBA_WIDTH.to_string() || h != GBA_HEIGHT.to_string() || maxval != "255" {
-        return Err(bad(&format!("expected 240x160 maxval 255, got {w}x{h} maxval {maxval}")));
+        return Err(bad(&format!(
+            "expected 240x160 maxval 255, got {w}x{h} maxval {maxval}"
+        )));
     }
-    // Exactly one whitespace byte separates the header from the pixel data.
-    let body = data.get(pos + 1..pos + 1 + GBA_WIDTH * GBA_HEIGHT * 3).ok_or_else(|| bad("truncated PPM data"))?;
-    Ok(body.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 0xFF]).collect())
+    // The netpbm spec puts exactly one whitespace byte between maxval and the
+    // pixels, and pixel bytes can themselves have whitespace values, so they
+    // can't be skipped. Require the exact length instead, so a header like
+    // "255\n\n" is an error rather than a silently shifted image.
+    let expected = GBA_WIDTH * GBA_HEIGHT * 3;
+    let body = data.get(pos + 1..).unwrap_or_default();
+    if body.len() != expected {
+        return Err(bad(&format!(
+            "expected {expected} pixel bytes after the header, found {} (extra whitespace after maxval?)",
+            body.len()
+        )));
+    }
+    Ok(body
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|p| [p[0], p[1], p[2], 0xFF])
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -222,8 +258,15 @@ fn tri(v: u64, max: usize) -> usize {
 }
 
 fn bars(x: usize, y: usize) -> [u8; 3] {
-    const COLORS: [[u8; 3]; 7] =
-        [[192, 192, 192], [192, 192, 0], [0, 192, 192], [0, 192, 0], [192, 0, 192], [192, 0, 0], [0, 0, 192]];
+    const COLORS: [[u8; 3]; 7] = [
+        [192, 192, 192],
+        [192, 192, 0],
+        [0, 192, 192],
+        [0, 192, 0],
+        [192, 0, 192],
+        [192, 0, 0],
+        [0, 0, 192],
+    ];
     if y < GBA_HEIGHT * 2 / 3 {
         COLORS[x * COLORS.len() / GBA_WIDTH]
     } else {
@@ -239,7 +282,10 @@ struct FrameGen {
 
 impl FrameGen {
     fn new() -> Self {
-        Self { rng: 0x9E37_79B9_7F4A_7C15, buf: vec![0; FRAME_BYTES] }
+        Self {
+            rng: 0x9E37_79B9_7F4A_7C15,
+            buf: vec![0; FRAME_BYTES],
+        }
     }
 
     fn fill(&mut self, pattern: Pattern, t: u64, image: Option<&[u8]>) -> &[u8] {
@@ -258,11 +304,17 @@ impl FrameGen {
                     Pattern::Bars => bars(x, y),
                     Pattern::Checker => {
                         let s = t as usize;
-                        if ((x + s) / 16 + (y + s / 2) / 16).is_multiple_of(2) { [235, 235, 220] } else { [40, 40, 90] }
+                        if ((x + s) / 16 + (y + s / 2) / 16).is_multiple_of(2) {
+                            [235, 235, 220]
+                        } else {
+                            [40, 40, 90]
+                        }
                     }
-                    Pattern::Gradient => {
-                        [(x * 255 / (GBA_WIDTH - 1)) as u8, (y * 255 / (GBA_HEIGHT - 1)) as u8, blue]
-                    }
+                    Pattern::Gradient => [
+                        (x * 255 / (GBA_WIDTH - 1)) as u8,
+                        (y * 255 / (GBA_HEIGHT - 1)) as u8,
+                        blue,
+                    ],
                     Pattern::Sprite => {
                         if (sx..sx + 16).contains(&x) && (sy..sy + 16).contains(&y) {
                             [255, 255, 255]
@@ -336,7 +388,9 @@ impl Config {
 
     fn build<'a, W: Write + 'a>(&self, out: W, size: SizeSource) -> Box<dyn Renderer + 'a> {
         match self.mode {
-            RenderMode::HalfBlock => Box::new(HalfBlockRenderer::with_writer(out, size, self.depth)),
+            RenderMode::HalfBlock => {
+                Box::new(HalfBlockRenderer::with_writer(out, size, self.depth))
+            }
             RenderMode::Kitty => {
                 let mut k = KittyRenderer::with_writer(out, size, self.strategy);
                 k.set_compression(self.compress);
@@ -376,11 +430,36 @@ fn run_bench(opts: &Opts) -> io::Result<()> {
     let frames = opts.frames.unwrap_or(300);
     let size = SizeSource::Fixed(opts.size);
     let configs = [
-        Config { mode: RenderMode::HalfBlock, strategy: KittyStrategy::FrameEdit, depth: ColorDepth::TrueColor, compress: false },
-        Config { mode: RenderMode::HalfBlock, strategy: KittyStrategy::FrameEdit, depth: ColorDepth::Ansi256, compress: false },
-        Config { mode: RenderMode::Kitty, strategy: KittyStrategy::FrameEdit, depth: ColorDepth::TrueColor, compress: true },
-        Config { mode: RenderMode::Kitty, strategy: KittyStrategy::Retransmit, depth: ColorDepth::TrueColor, compress: true },
-        Config { mode: RenderMode::Kitty, strategy: KittyStrategy::Retransmit, depth: ColorDepth::TrueColor, compress: false },
+        Config {
+            mode: RenderMode::HalfBlock,
+            strategy: KittyStrategy::FrameEdit,
+            depth: ColorDepth::TrueColor,
+            compress: false,
+        },
+        Config {
+            mode: RenderMode::HalfBlock,
+            strategy: KittyStrategy::FrameEdit,
+            depth: ColorDepth::Ansi256,
+            compress: false,
+        },
+        Config {
+            mode: RenderMode::Kitty,
+            strategy: KittyStrategy::FrameEdit,
+            depth: ColorDepth::TrueColor,
+            compress: true,
+        },
+        Config {
+            mode: RenderMode::Kitty,
+            strategy: KittyStrategy::Retransmit,
+            depth: ColorDepth::TrueColor,
+            compress: true,
+        },
+        Config {
+            mode: RenderMode::Kitty,
+            strategy: KittyStrategy::Retransmit,
+            depth: ColorDepth::TrueColor,
+            compress: false,
+        },
     ];
     let mut patterns = SYNTHETIC.to_vec();
     if opts.image.is_some() {
@@ -388,17 +467,29 @@ fn run_bench(opts: &Opts) -> io::Result<()> {
     }
 
     println!(
-        "{frames} frames per run, terminal {}x{} cells @ {}x{} px (encode cost only, output discarded)\n",
+        "{frames} frames per run, terminal {}x{} cells @ {}x{} px\n\
+         Times are encode cost only (output is discarded), not achievable frame rates: the\n\
+         bytes still have to pass through the pty and the terminal's parser. If MB/s@60 is\n\
+         more than your terminal keeps up with, the main loop needs frame skipping.\n",
         opts.size.cols, opts.size.rows, opts.size.px_width, opts.size.px_height
     );
-    println!("{:<24} {:<9} {:>9} {:>9} {:>10} {:>10}", "renderer", "pattern", "avg ms", "max ms", "KB/frame", "MB/s@60");
+    println!(
+        "{:<24} {:<9} {:>9} {:>9} {:>10} {:>10}",
+        "renderer", "pattern", "avg ms", "max ms", "KB/frame", "MB/s@60"
+    );
     let mut frame_gen = FrameGen::new();
     for cfg in configs {
         for &pattern in &patterns {
             let bytes = Rc::new(Cell::new(0));
             let mut stats = Stats::default();
             {
-                let mut r = cfg.build(Counting { inner: io::sink(), bytes: bytes.clone() }, size);
+                let mut r = cfg.build(
+                    Counting {
+                        inner: io::sink(),
+                        bytes: bytes.clone(),
+                    },
+                    size,
+                );
                 for t in 0..frames {
                     let px = frame_gen.fill(pattern, t, opts.image.as_deref());
                     let start = Instant::now();
@@ -421,21 +512,6 @@ fn run_bench(opts: &Opts) -> io::Result<()> {
     Ok(())
 }
 
-struct RawMode;
-
-impl RawMode {
-    fn enable() -> io::Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
 fn run_interactive(opts: Opts) -> io::Result<()> {
     let mut cfg = Config {
         mode: opts.mode.unwrap_or_else(render::detect_mode),
@@ -447,8 +523,8 @@ fn run_interactive(opts: Opts) -> io::Result<()> {
     let mut all_stats: Vec<(String, Stats)> = Vec::new();
 
     {
-        let _raw = RawMode::enable()?;
-        let _screen = ScreenGuard::enter()?;
+        // Raw mode and the alternate screen are owned by input.rs.
+        let _guard = RawModeGuard::enter()?;
         let interval = Duration::from_secs_f64(1.0 / opts.fps);
         let mut frame_gen = FrameGen::new();
         let mut t = 0u64;
@@ -458,7 +534,13 @@ fn run_interactive(opts: Opts) -> io::Result<()> {
             let label = cfg.label();
             let bytes = Rc::new(Cell::new(0));
             let mut stats = Stats::default();
-            let mut renderer = cfg.build(Counting { inner: io::stdout(), bytes: bytes.clone() }, SizeSource::Auto);
+            let mut renderer = cfg.build(
+                Counting {
+                    inner: io::stdout(),
+                    bytes: bytes.clone(),
+                },
+                SizeSource::Auto,
+            );
             let mut next = Instant::now();
             let mut rebuild = false;
 
@@ -479,14 +561,20 @@ fn run_interactive(opts: Opts) -> io::Result<()> {
                     next = now;
                 }
                 while event::poll(next.saturating_duration_since(Instant::now()))? {
-                    let Event::Key(key) = event::read()? else { continue };
+                    let Event::Key(key) = event::read()? else {
+                        continue;
+                    };
                     if key.kind == KeyEventKind::Release {
                         continue;
                     }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => quit = true,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => quit = true,
-                        KeyCode::Char(c @ '1'..='5') => pattern = SYNTHETIC[c as usize - '1' as usize],
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            quit = true
+                        }
+                        KeyCode::Char(c @ '1'..='5') => {
+                            pattern = SYNTHETIC[c as usize - '1' as usize]
+                        }
                         KeyCode::Char('6') if opts.image.is_some() => pattern = Pattern::Image,
                         KeyCode::Char('m') => {
                             cfg.mode = match cfg.mode {
@@ -522,14 +610,13 @@ fn run_interactive(opts: Opts) -> io::Result<()> {
     }
 
     for (label, s) in all_stats.iter().filter(|(_, s)| s.frames > 0) {
-        let fps = s.frames as f64 / s.draw.as_secs_f64().max(1e-9);
         println!(
-            "{label}: {} frames, draw avg {:.2} ms (max {:.2}), {:.1} KB/frame, draw-only ceiling {:.0} fps",
+            "{label}: {} frames, draw avg {:.2} ms (max {:.2}), {:.1} KB/frame ({:.2} MB/s at 60 fps)",
             s.frames,
             s.avg_ms(),
             s.max_draw.as_secs_f64() * 1000.0,
             s.avg_kb(),
-            fps
+            s.avg_kb() * 60.0 / 1024.0,
         );
     }
     Ok(())

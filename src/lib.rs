@@ -2,6 +2,7 @@
 
 pub mod input;
 pub mod audio;
+pub mod render;
 
 // Re-exports for convenience
 pub use input::{KeyState, RawModeGuard, poll_keys, KEY_A, KEY_B, KEY_SELECT, KEY_START, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_L, KEY_R, KEY_QUIT};

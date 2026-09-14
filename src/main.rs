@@ -3,6 +3,7 @@
 //!   cargo run --release -- path/to/game.gba
 //!   cargo run --release -- --mode halfblock --mute path/to/game.gba
 
+use std::ffi::{c_char, c_void};
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,6 +12,25 @@ use terminal_gba_translator::render::{self, HalfBlockRenderer, KittyRenderer, Re
 #[cfg(feature = "native-audio")]
 use terminal_gba_translator::AudioOut;
 use terminal_gba_translator::{run, AudioSink, RawModeGuard, RunError, TerminalInput};
+
+// Keep the native archive on the final binary link line. The published
+// `mgba-sys` crate emits its archive search path but has no `links` manifest
+// key, so current Cargo/Rust can otherwise omit the archive for this binary.
+#[cfg(feature = "mgba")]
+#[link(name = "mgba", kind = "static")]
+unsafe extern "C" {}
+
+// The static archive is listed before dependent Rust rlibs by current Cargo.
+// Keep one symbol referenced by this final binary object so the linker sees an
+// unresolved mGBA symbol before it scans `libmgba.a`.
+#[cfg(feature = "mgba")]
+unsafe extern "C" {
+    fn mCoreLoadFile(core: *mut c_void, path: *const c_char) -> bool;
+}
+
+#[cfg(feature = "mgba")]
+#[used]
+static MGBA_LINK_ANCHOR: unsafe extern "C" fn(*mut c_void, *const c_char) -> bool = mCoreLoadFile;
 
 const USAGE: &str = "\
 termgba: a terminal frontend for Game Boy Advance games
@@ -72,7 +92,7 @@ enum Audio {
 }
 
 impl AudioSink for Audio {
-    fn push(&mut self, samples: &[i16]) -> io::Result<()> {
+    fn push(&mut self, _samples: &[i16]) -> io::Result<()> {
         match self {
             #[cfg(feature = "native-audio")]
             Self::Native(out) => AudioSink::push(out, samples),

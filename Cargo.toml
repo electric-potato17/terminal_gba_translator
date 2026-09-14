@@ -1,13 +1,32 @@
 [package]
-name = "termgba"
+name = "terminal_gba_translator"
 version = "0.1.0"
 edition = "2021"
 description = "A terminal frontend for Game Boy Advance games"
 license = "MIT"
 
 [features]
-default = ["mgba"]
+default = ["mgba", "native-audio"]
 mgba = ["dep:mgba"]
+native-audio = ["dep:cpal"]
+mock-audio = []
 
 [dependencies]
+crossterm = "0.27"
+cpal = { version = "0.15", optional = true }
+thiserror = "1.0"
 mgba = { version = "0.1.0", optional = true }
+
+[dev-dependencies]
+# For integration tests with pty (optional, later)
+# async-process = "1.0"
+# tokio = { version = "1", features = ["process", "macros", "rt-multi-thread"] }
+
+[[example]]
+name = "test_input"
+path = "examples/test_input.rs"
+
+[[example]]
+name = "test_audio"
+path = "examples/test_audio.rs"
+required-features = ["native-audio"]

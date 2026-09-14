@@ -11,12 +11,19 @@ use std::io;
 use std::path::Path;
 
 use emu::{CoreBackend, Emu, EmuError};
-use input::InputPoller;
 use render::Renderer;
 
 pub use audio::AudioSink;
+#[cfg(feature = "mock-audio")]
+pub use audio::MockAudioOut;
+pub use audio::{gen_sine_frame, RingBuffer};
+#[cfg(feature = "native-audio")]
+pub use audio::{AudioError, AudioOut};
 pub use emu::{Emu as Emulator, Frame};
-pub use input::KeyState;
+pub use input::{
+    poll_keys, GbaButton, InputPoller, KeyState, RawModeGuard, TerminalInput, KEY_A, KEY_B,
+    KEY_DOWN, KEY_L, KEY_LEFT, KEY_QUIT, KEY_R, KEY_RIGHT, KEY_SELECT, KEY_START, KEY_UP,
+};
 
 /// Errors returned by the integrated emulation loop.
 #[derive(Debug)]

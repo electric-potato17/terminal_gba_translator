@@ -5,10 +5,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use termgba::emu::{Emu, Frame};
-use termgba::input::{GbaButton, InputPoller, KeyState};
-use termgba::render::Renderer;
-use termgba::{run, AudioSink, RunError};
+use terminal_gba_translator::emu::{Emu, Frame};
+use terminal_gba_translator::input::{GbaButton, InputPoller, KeyState};
+use terminal_gba_translator::render::Renderer;
+use terminal_gba_translator::{run, AudioSink, RunError};
 
 static NEXT_ROM: AtomicU64 = AtomicU64::new(0);
 

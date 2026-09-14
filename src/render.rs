@@ -32,6 +32,9 @@ pub const GBA_WIDTH: usize = 240;
 pub const GBA_HEIGHT: usize = 160;
 pub const FRAME_BYTES: usize = GBA_WIDTH * GBA_HEIGHT * 4;
 
+// The core loop hands renderers `emu::Frame::pixels`, so the sizes must agree.
+const _: () = assert!(FRAME_BYTES == crate::emu::Frame::PIXEL_BYTES);
+
 const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 const SYNC_END: &[u8] = b"\x1b[?2026l";
 const KITTY_CHUNK: usize = 4096;

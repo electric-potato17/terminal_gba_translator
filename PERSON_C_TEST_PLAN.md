@@ -39,7 +39,7 @@ const KEY_L: u16       = 1 << 9;
 | `a` / `s`    | L / R      |
 | `q` / `Esc`  | Quit flag  |
 
-### Test Binary: `cargo run --bin test_input`
+### Test Example: `cargo run --example test_input`
 - Enters raw mode
 - Spawns a thread that calls `poll_keys(&mut keys)` in a tight loop (or on crossterm event poll)
 - Prints every state change to stdout as structured log:
@@ -94,7 +94,7 @@ const FRAME_SAMPLES: usize = 735;    // 44100 / 59.7275 ≈ 735 per channel per 
 const RING_CAPACITY: usize = FRAME_SAMPLES * 4;  // ~4 frames buffer
 ```
 
-### Test Binary: `cargo run --bin test_audio`
+### Test Example: `cargo run --example test_audio`
 - Creates `AudioOut::new()` (negotiates default output device)
 - Generates a **sine wave** at 440 Hz (A4) in a loop:
   ```rust
@@ -146,13 +146,13 @@ impl MockAudioOut {
 
 ### Cargo.toml Additions
 ```toml
-[[bin]]
+[[example]]
 name = "test_input"
-path = "tests/test_input.rs"
+path = "examples/test_input.rs"
 
-[[bin]]
+[[example]]
 name = "test_audio"
-path = "tests/test_audio.rs"
+path = "examples/test_audio.rs"
 
 [features]
 mock-audio = []
@@ -163,10 +163,10 @@ mock-audio = []
 src/
   input.rs          # public API + unit tests
   audio.rs          # public API + unit tests
-tests/
-  test_input.rs     # standalone binary: runs interactive key logger
-  test_audio.rs     # standalone binary: plays sine wave
-  input_integration.rs  # pty-based automated test (optional, later)
+examples/
+  test_input.rs     # standalone example: runs interactive key logger
+  test_audio.rs     # standalone example: plays sine wave
+  # input_integration.rs  # pty-based automated test (optional, later)
 ```
 
 ### Running Tests
@@ -175,11 +175,11 @@ tests/
 cargo test --lib input audio
 
 # Manual interactive test — input
-cargo run --bin test_input
+cargo run --example test_input
 # Press keys, watch log, press q to quit
 
 # Manual interactive test — audio
-cargo run --bin test_audio
+cargo run --example test_audio
 # Hear 440 Hz tone for 3 seconds
 
 # CI-friendly (mock audio)
@@ -192,9 +192,9 @@ cargo test --features mock-audio
 
 | Module | Test | Pass Criteria |
 |--------|------|---------------|
-| `input.rs` | `cargo run --bin test_input` | Every keypress prints `[INPUT] t=... keys=0xXXXX pressed=X / released=X`; `q`/`Esc` exits cleanly |
+| `input.rs` | `cargo run --example test_input` | Every keypress prints `[INPUT] t=... keys=0xXXXX pressed=X / released=X`; `q`/`Esc` exits cleanly |
 | `input.rs` | `cargo test input` | All unit tests pass (bitmask ops, mapping) |
-| `audio.rs` | `cargo run --bin test_audio` | Audible 440 Hz tone for ~3s, no crackle/underrun, clean exit |
+| `audio.rs` | `cargo run --example test_audio` | Audible 440 Hz tone for ~3s, no crackle/underrun, clean exit |
 | `audio.rs` | `cargo test audio` | All unit tests pass (ring buffer, sine gen) |
 | `audio.rs` | `cargo test --features mock-audio` | CI passes without audio device |
 

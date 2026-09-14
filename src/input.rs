@@ -1,5 +1,5 @@
 //! Terminal input → GBA KeyState
-//! Testable standalone: `cargo run --bin test_input`
+//! Testable standalone: `cargo run --example test_input`
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -72,9 +72,9 @@ impl Drop for RawModeGuard {
 
 /// Non-blocking key poll — updates KeyState with pressed/released keys
 pub fn poll_keys(state: &mut KeyState) {
-    // Poll with zero timeout — returns immediately
-    if event::poll(Duration::ZERO).unwrap_or(false) {
-        while let Ok(Event::Key(KeyEvent { code, modifiers, kind, .. })) = event::read() {
+    // Poll with zero timeout — only call read() when event is ready
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(KeyEvent { code, modifiers, kind, .. })) = event::read() {
             let pressed = matches!(kind, event::KeyEventKind::Press | event::KeyEventKind::Repeat);
             let released = matches!(kind, event::KeyEventKind::Release);
 
@@ -85,6 +85,7 @@ pub fn poll_keys(state: &mut KeyState) {
                     log_key_change(gba_key, pressed);
                 }
             }
+            // Non-Key events (Resize, etc.) are ignored but consumed
         }
     }
 }

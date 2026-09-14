@@ -1,5 +1,5 @@
 //! Standalone input test binary — runs interactive key logger
-//! Usage: `cargo run --bin test_input`
+//! Usage: `cargo run --example test_input`
 //! Press keys to see log output. Press 'q' or Esc to quit.
 
 use std::io;

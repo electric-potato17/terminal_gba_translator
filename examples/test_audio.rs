@@ -1,5 +1,5 @@
 //! Standalone audio test binary — plays 440 Hz sine wave for 3 seconds
-//! Usage: `cargo run --bin test_audio`
+//! Usage: `cargo run --example test_audio`
 //! Verifies cpal pipeline works end-to-end.
 
 use std::io::Write;

@@ -1,0 +1,13 @@
+[package]
+name = "termgba"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal frontend for Game Boy Advance games"
+license = "MIT"
+
+[features]
+default = ["mgba"]
+mgba = ["dep:mgba"]
+
+[dependencies]
+mgba = { version = "0.1.0", optional = true }

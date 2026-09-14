@@ -2,11 +2,27 @@
 //! Testable standalone: `cargo run --example test_input`
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Without key-release events, a button counts as held until this long passes
+/// with no press or auto-repeat for it.
+const HOLD_TIMEOUT: Duration = Duration::from_millis(200);
+
+static LOG_KEYS: AtomicBool = AtomicBool::new(false);
+
+/// Print every key change to stdout. Off by default because it would draw over
+/// the game screen; the `test_input` example turns it on.
+pub fn set_key_logging(on: bool) {
+    LOG_KEYS.store(on, Ordering::Relaxed);
+}
 
 /// GBA key bitmask matching mGBA constants
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,11 +116,41 @@ pub trait InputPoller {
 }
 
 /// Adapter that exposes the terminal's global event queue as an `InputPoller`.
-pub struct TerminalInput;
+///
+/// Most terminals only report key presses (plus auto-repeat), never releases.
+/// In that case a button is released once it goes [`HOLD_TIMEOUT`] without a
+/// press or repeat event, so held keys don't stick down forever.
+pub struct TerminalInput {
+    release_events: bool,
+    last_seen: [Option<Instant>; 16],
+}
+
+impl TerminalInput {
+    /// `release_events` should come from [`RawModeGuard::reports_key_release`].
+    pub fn new(release_events: bool) -> Self {
+        Self {
+            release_events,
+            last_seen: [None; 16],
+        }
+    }
+}
 
 impl InputPoller for TerminalInput {
     fn poll_keys(&mut self, state: &mut KeyState) -> io::Result<()> {
-        poll_keys(state);
+        let now = Instant::now();
+        drain_key_events(|key, pressed| {
+            state.set(key, pressed);
+            self.last_seen[key.trailing_zeros() as usize] = pressed.then_some(now);
+        });
+
+        if !self.release_events {
+            for (bit, seen) in self.last_seen.iter_mut().enumerate() {
+                if seen.is_some_and(|t| now.duration_since(t) >= HOLD_TIMEOUT) {
+                    *seen = None;
+                    state.set(1 << bit, false);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -112,19 +158,40 @@ impl InputPoller for TerminalInput {
 /// RAII guard for raw mode — restores terminal on drop
 pub struct RawModeGuard {
     _stdout: Stdout,
+    release_events: bool,
 }
 
 impl RawModeGuard {
     pub fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
+        // Ask for key-release events where the terminal supports the Kitty
+        // keyboard protocol (kitty, Ghostty, WezTerm, foot, ...).
+        let release_events = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if release_events {
+            crossterm::execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            )?;
+        }
         crossterm::execute!(stdout, EnterAlternateScreen)?;
-        Ok(Self { _stdout: stdout })
+        Ok(Self {
+            _stdout: stdout,
+            release_events,
+        })
+    }
+
+    /// Whether the terminal will send key-release events.
+    pub fn reports_key_release(&self) -> bool {
+        self.release_events
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        if self.release_events {
+            let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = terminal::disable_raw_mode();
         let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
     }
@@ -132,6 +199,12 @@ impl Drop for RawModeGuard {
 
 /// Non-blocking key poll — updates KeyState with pressed/released keys
 pub fn poll_keys(state: &mut KeyState) {
+    drain_key_events(|key, pressed| state.set(key, pressed));
+}
+
+/// Read every pending key event without blocking, calling `on_key` with each
+/// mapped GBA key and whether it went down or up.
+fn drain_key_events(mut on_key: impl FnMut(u16, bool)) {
     // Poll with zero timeout — only call read() when event is ready
     while event::poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(KeyEvent {
@@ -150,7 +223,7 @@ pub fn poll_keys(state: &mut KeyState) {
             if pressed || released {
                 let gba_key = map_key(code, modifiers);
                 if gba_key != 0 {
-                    state.set(gba_key, pressed);
+                    on_key(gba_key, pressed);
                     log_key_change(gba_key, pressed);
                 }
             }
@@ -177,6 +250,9 @@ fn map_key(code: KeyCode, _modifiers: KeyModifiers) -> u16 {
 }
 
 fn log_key_change(key: u16, pressed: bool) {
+    if !LOG_KEYS.load(Ordering::Relaxed) {
+        return;
+    }
     let name = key_name(key);
     let action = if pressed { "pressed" } else { "released" };
     let timestamp = Instant::now().elapsed().as_millis();

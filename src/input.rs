@@ -27,9 +27,46 @@ pub const KEY_L: u16 = 1 << 9;
 /// Quit flag (not a GBA key, used by main loop)
 pub const KEY_QUIT: u16 = 1 << 15;
 
+/// GBA buttons in the bit order expected by mGBA.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GbaButton {
+    A = 0,
+    B = 1,
+    Select = 2,
+    Start = 3,
+    Right = 4,
+    Left = 5,
+    Up = 6,
+    Down = 7,
+    R = 8,
+    L = 9,
+}
+
+impl GbaButton {
+    pub const fn mask(self) -> u16 {
+        1 << self as u16
+    }
+}
+
 impl KeyState {
+    pub const GBA_BUTTON_MASK: u16 = 0x03ff;
+    pub const QUIT_MASK: u16 = KEY_QUIT;
+
     pub fn new() -> Self {
         Self(0)
+    }
+
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(&self) -> u16 {
+        self.0
+    }
+
+    pub const fn gba_bits(&self) -> u16 {
+        self.0 & Self::GBA_BUTTON_MASK
     }
 
     pub fn is_pressed(&self, key: u16) -> bool {
@@ -46,6 +83,29 @@ impl KeyState {
 
     pub fn quit_pressed(&self) -> bool {
         self.is_pressed(KEY_QUIT)
+    }
+
+    pub fn set_button(&mut self, button: GbaButton, pressed: bool) {
+        self.set(button.mask(), pressed);
+    }
+
+    pub fn set_quit(&mut self, pressed: bool) {
+        self.set(KEY_QUIT, pressed);
+    }
+}
+
+/// Non-blocking input source used by the core frame loop.
+pub trait InputPoller {
+    fn poll_keys(&mut self, state: &mut KeyState) -> io::Result<()>;
+}
+
+/// Adapter that exposes the terminal's global event queue as an `InputPoller`.
+pub struct TerminalInput;
+
+impl InputPoller for TerminalInput {
+    fn poll_keys(&mut self, state: &mut KeyState) -> io::Result<()> {
+        poll_keys(state);
+        Ok(())
     }
 }
 
@@ -74,8 +134,17 @@ impl Drop for RawModeGuard {
 pub fn poll_keys(state: &mut KeyState) {
     // Poll with zero timeout — only call read() when event is ready
     while event::poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(KeyEvent { code, modifiers, kind, .. })) = event::read() {
-            let pressed = matches!(kind, event::KeyEventKind::Press | event::KeyEventKind::Repeat);
+        if let Ok(Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind,
+            ..
+        })) = event::read()
+        {
+            let pressed = matches!(
+                kind,
+                event::KeyEventKind::Press | event::KeyEventKind::Repeat
+            );
             let released = matches!(kind, event::KeyEventKind::Release);
 
             if pressed || released {
@@ -111,7 +180,10 @@ fn log_key_change(key: u16, pressed: bool) {
     let name = key_name(key);
     let action = if pressed { "pressed" } else { "released" };
     let timestamp = Instant::now().elapsed().as_millis();
-    println!("[INPUT] t={}ms keys=0x{:04X} {action}={name}", timestamp, key);
+    println!(
+        "[INPUT] t={}ms keys=0x{:04X} {action}={name}",
+        timestamp, key
+    );
 }
 
 fn key_name(key: u16) -> &'static str {

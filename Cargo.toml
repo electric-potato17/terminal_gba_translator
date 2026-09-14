@@ -2,14 +2,20 @@
 name = "terminal_gba_translator"
 version = "0.1.0"
 edition = "2021"
+description = "A terminal frontend for Game Boy Advance games"
+license = "MIT"
 
 [features]
+default = ["mgba", "native-audio"]
+mgba = ["dep:mgba"]
+native-audio = ["dep:cpal"]
 mock-audio = []
 
 [dependencies]
 crossterm = "0.27"
-cpal = "0.15"
+cpal = { version = "0.15", optional = true }
 thiserror = "1.0"
+mgba = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
 # For integration tests with pty (optional, later)
@@ -23,3 +29,4 @@ path = "examples/test_input.rs"
 [[example]]
 name = "test_audio"
 path = "examples/test_audio.rs"
+required-features = ["native-audio"]

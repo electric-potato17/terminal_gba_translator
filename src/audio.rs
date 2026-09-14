@@ -2,11 +2,28 @@
 //! Testable standalone: `cargo run --bin test_audio` (plays 440 Hz sine wave)
 //! CI-testable: `cargo test --features mock-audio`
 
+#[cfg(feature = "native-audio")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// A destination for interleaved stereo PCM samples.
+pub trait AudioSink {
+    fn push(&mut self, samples: &[i16]) -> std::io::Result<()>;
+}
+
+pub fn validate_samples(samples: &[i16]) -> std::io::Result<()> {
+    if !samples.len().is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "GBA audio must contain interleaved stereo samples",
+        ));
+    }
+    Ok(())
+}
+
 /// Audio output handle — owns cpal stream + lock-free ring buffer
+#[cfg(feature = "native-audio")]
 pub struct AudioOut {
     _stream: cpal::Stream,
     ring: RingBuffer,
@@ -14,13 +31,12 @@ pub struct AudioOut {
     channels: u16,
 }
 
+#[cfg(feature = "native-audio")]
 impl AudioOut {
     /// Create new audio output on default device, negotiated sample rate
     pub fn new() -> Result<Self, AudioError> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(AudioError::NoDevice)?;
+        let device = host.default_output_device().ok_or(AudioError::NoDevice)?;
 
         let config = device.default_output_config()?;
         let sample_rate = config.sample_rate().0;
@@ -62,6 +78,16 @@ impl AudioOut {
     }
 }
 
+#[cfg(feature = "native-audio")]
+impl AudioSink for AudioOut {
+    fn push(&mut self, samples: &[i16]) -> std::io::Result<()> {
+        validate_samples(samples)?;
+        self.ring.write_i16(samples);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "native-audio")]
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     #[error("no default output device")]
@@ -85,6 +111,10 @@ pub struct RingBuffer {
 
 impl RingBuffer {
     pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity > 1,
+            "ring buffer capacity must be greater than one"
+        );
         let buf = (0..capacity)
             .map(|_| std::sync::atomic::AtomicI16::new(0))
             .collect();
@@ -123,15 +153,15 @@ impl RingBuffer {
         let available = self.available_read(rp, wp);
         let to_read = out.len().min(available);
 
-        for i in 0..to_read {
+        for sample_out in out.iter_mut().take(to_read) {
             let sample = self.buf[rp].load(Ordering::Relaxed);
-            out[i] = sample as f32 / i16::MAX as f32;
+            *sample_out = sample as f32 / i16::MAX as f32;
             rp = (rp + 1) % self.cap;
         }
 
         // Fill remainder with silence
-        for i in to_read..out.len() {
-            out[i] = 0.0;
+        for sample_out in out.iter_mut().skip(to_read) {
+            *sample_out = 0.0;
         }
 
         self.read_pos.store(rp, Ordering::Release);
@@ -155,14 +185,10 @@ impl RingBuffer {
 }
 
 /// Generate sine wave frame (stereo interleaved i16)
-pub fn gen_sine_frame(
-    frame: &mut [i16],
-    frequency: f32,
-    sample_rate: u32,
-    phase: &mut f32,
-) {
+pub fn gen_sine_frame(frame: &mut [i16], frequency: f32, sample_rate: u32, phase: &mut f32) {
     let step = frequency * 2.0 * std::f32::consts::PI / sample_rate as f32;
-    for chunk in frame.chunks_exact_mut(2) {
+    let (stereo_samples, _) = frame.as_chunks_mut::<2>();
+    for chunk in stereo_samples {
         let sample = (phase.sin() * i16::MAX as f32) as i16;
         chunk[0] = sample; // left
         chunk[1] = sample; // right
@@ -194,6 +220,22 @@ impl MockAudioOut {
 
     pub fn into_buffer(self) -> Vec<i16> {
         self.buffer
+    }
+}
+
+#[cfg(feature = "mock-audio")]
+impl Default for MockAudioOut {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "mock-audio")]
+impl AudioSink for MockAudioOut {
+    fn push(&mut self, samples: &[i16]) -> std::io::Result<()> {
+        validate_samples(samples)?;
+        self.buffer.extend_from_slice(samples);
+        Ok(())
     }
 }
 
@@ -246,6 +288,18 @@ mod tests {
         }
         // ~440 Hz * (735/44100) seconds = ~7.3 cycles = ~14.6 zero crossings
         assert!((13..17).contains(&crossings), "crossings={crossings}");
+    }
+
+    #[test]
+    fn rejects_partial_stereo_samples() {
+        assert!(validate_samples(&[1]).is_err());
+        assert!(validate_samples(&[1, -1]).is_ok());
+    }
+
+    #[test]
+    fn rejects_ring_buffers_that_cannot_represent_empty_and_full_states() {
+        assert!(std::panic::catch_unwind(|| RingBuffer::new(0)).is_err());
+        assert!(std::panic::catch_unwind(|| RingBuffer::new(1)).is_err());
     }
 
     #[cfg(feature = "mock-audio")]

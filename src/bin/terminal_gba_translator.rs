@@ -57,8 +57,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut emu = Emu::load(&rom_path)?;
     let mut audio = AudioOut::new()?;
     let mut renderer = make_renderer(detect_mode());
-    let _terminal = RawModeGuard::enter()?;
     let mut input = TerminalInput;
+    let _terminal = RawModeGuard::enter()?;
 
     run_with_emu(&mut emu, &mut *renderer, &mut input, &mut audio)?;
     Ok(())

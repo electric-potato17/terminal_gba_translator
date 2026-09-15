@@ -18,6 +18,16 @@ const HOLD_TIMEOUT: Duration = Duration::from_millis(200);
 
 static LOG_KEYS: AtomicBool = AtomicBool::new(false);
 
+/// Some PTY harnesses do not answer crossterm's terminal capability query.
+/// Let automated runs skip that query while keeping capability detection for
+/// normal interactive terminals.
+fn terminal_reports_key_release() -> bool {
+    if std::env::var_os("TERMGBA_NO_KEYBOARD_QUERY").is_some() {
+        return false;
+    }
+    terminal::supports_keyboard_enhancement().unwrap_or(false)
+}
+
 /// Print every key change to stdout. Off by default because it would draw over
 /// the game screen; the `test_input` example turns it on.
 pub fn set_key_logging(on: bool) {
@@ -167,7 +177,7 @@ impl RawModeGuard {
         let mut stdout = io::stdout();
         // Ask for key-release events where the terminal supports the Kitty
         // keyboard protocol (kitty, Ghostty, WezTerm, foot, ...).
-        let release_events = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let release_events = terminal_reports_key_release();
         if release_events {
             crossterm::execute!(
                 stdout,

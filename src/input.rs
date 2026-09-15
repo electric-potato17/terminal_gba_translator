@@ -53,6 +53,9 @@ pub const KEY_L: u16 = 1 << 9;
 /// Quit flag (not a GBA key, used by main loop)
 pub const KEY_QUIT: u16 = 1 << 15;
 
+/// Turbo modifier (a frontend control, not sent to the GBA)
+pub const KEY_TURBO: u16 = 1 << 14;
+
 /// GBA buttons in the bit order expected by mGBA.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +81,7 @@ impl GbaButton {
 impl KeyState {
     pub const GBA_BUTTON_MASK: u16 = 0x03ff;
     pub const QUIT_MASK: u16 = KEY_QUIT;
+    pub const TURBO_MASK: u16 = KEY_TURBO;
 
     pub fn new() -> Self {
         Self(0)
@@ -109,6 +113,10 @@ impl KeyState {
 
     pub fn quit_pressed(&self) -> bool {
         self.is_pressed(KEY_QUIT)
+    }
+
+    pub fn turbo_pressed(&self) -> bool {
+        self.is_pressed(KEY_TURBO)
     }
 
     pub fn set_button(&mut self, button: GbaButton, pressed: bool) {
@@ -254,6 +262,7 @@ fn map_key(code: KeyCode, _modifiers: KeyModifiers) -> u16 {
         KeyCode::Down => KEY_DOWN,
         KeyCode::Left => KEY_LEFT,
         KeyCode::Right => KEY_RIGHT,
+        KeyCode::Char(' ') => KEY_TURBO,
         KeyCode::Char('q') | KeyCode::Esc => KEY_QUIT,
         _ => 0,
     }
@@ -284,6 +293,7 @@ fn key_name(key: u16) -> &'static str {
         KEY_DOWN => "DOWN",
         KEY_R => "R",
         KEY_L => "L",
+        KEY_TURBO => "TURBO",
         KEY_QUIT => "QUIT",
         _ => "UNKNOWN",
     }
@@ -317,8 +327,21 @@ mod tests {
         assert_eq!(map_key(KeyCode::Down, KeyModifiers::empty()), KEY_DOWN);
         assert_eq!(map_key(KeyCode::Left, KeyModifiers::empty()), KEY_LEFT);
         assert_eq!(map_key(KeyCode::Right, KeyModifiers::empty()), KEY_RIGHT);
+        assert_eq!(
+            map_key(KeyCode::Char(' '), KeyModifiers::empty()),
+            KEY_TURBO
+        );
         assert_eq!(map_key(KeyCode::Char('q'), KeyModifiers::empty()), KEY_QUIT);
         assert_eq!(map_key(KeyCode::Esc, KeyModifiers::empty()), KEY_QUIT);
         assert_eq!(map_key(KeyCode::Char('w'), KeyModifiers::empty()), 0);
+    }
+
+    #[test]
+    fn turbo_is_not_sent_to_the_gba() {
+        let mut ks = KeyState::new();
+        ks.set(KEY_TURBO, true);
+
+        assert!(ks.turbo_pressed());
+        assert_eq!(ks.gba_bits(), 0);
     }
 }

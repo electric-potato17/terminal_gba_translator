@@ -34,6 +34,12 @@ impl FramePacer {
             self.next_tick = now + self.interval;
         }
     }
+
+    /// Drop the normal frame-rate limit while a frontend turbo modifier is
+    /// held, without leaving a stale deadline to delay the next normal frame.
+    pub fn skip_frame(&mut self) {
+        self.next_tick = Instant::now() + self.interval;
+    }
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 
 use std::io;
 use std::time::Duration;
-use terminal_gba_translator::{poll_keys, KeyState, RawModeGuard};
+use terminal_gba_translator::{poll_keys, set_key_logging, KeyState, RawModeGuard};
 
 fn main() -> io::Result<()> {
     println!("[TEST] Starting input test — press keys, 'q' or Esc to quit");
@@ -17,6 +17,7 @@ fn main() -> io::Result<()> {
     println!("  q/Esc    -> Quit");
     println!();
 
+    set_key_logging(true);
     let _guard = RawModeGuard::enter()?;
     let mut keys = KeyState::new();
     let start = std::time::Instant::now();

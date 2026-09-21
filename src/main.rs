@@ -43,7 +43,8 @@ OPTIONS:
   -h, --help                     show this help
 
 KEYS:
-  arrows D-pad   z A   x B   a L   s R   Enter Start   Tab Select   q / Esc quit
+  arrows D-pad   z A   x B   a L   s R   Enter Start   Tab Select
+  Space turbo    q / Esc quit
 ";
 
 struct Opts {

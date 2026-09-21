@@ -23,7 +23,7 @@ pub use emu::{Emu as Emulator, Frame};
 pub use input::{
     poll_keys, set_key_logging, GbaButton, InputPoller, KeyState, RawModeGuard, TerminalInput,
     KEY_A, KEY_B, KEY_DOWN, KEY_L, KEY_LEFT, KEY_QUIT, KEY_R, KEY_RIGHT, KEY_SELECT, KEY_START,
-    KEY_UP,
+    KEY_TURBO, KEY_UP,
 };
 
 /// Errors returned by the integrated emulation loop.
@@ -91,7 +91,11 @@ where
         if keys.quit_pressed() {
             break;
         }
-        pacer.sleep_until_next_frame();
+        if keys.turbo_pressed() {
+            pacer.skip_frame();
+        } else {
+            pacer.sleep_until_next_frame();
+        }
     }
 
     Ok(())

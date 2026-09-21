@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A terminal frontend for Game Boy Advance games"
 license = "MIT"
+default-run = "termgba"
 
 [features]
 default = ["mgba", "native-audio"]
@@ -23,6 +24,11 @@ mgba = { version = "0.1.0", optional = true }
 # For integration tests with pty (optional, later)
 # async-process = "1.0"
 # tokio = { version = "1", features = ["process", "macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "termgba"
+path = "src/main.rs"
+required-features = ["mgba"]
 
 [[example]]
 name = "test_input"

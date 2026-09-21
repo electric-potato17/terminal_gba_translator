@@ -21,8 +21,9 @@ pub use audio::{gen_sine_frame, RingBuffer};
 pub use audio::{AudioError, AudioOut};
 pub use emu::{Emu as Emulator, Frame};
 pub use input::{
-    poll_keys, GbaButton, InputPoller, KeyState, RawModeGuard, TerminalInput, KEY_A, KEY_B,
-    KEY_DOWN, KEY_L, KEY_LEFT, KEY_QUIT, KEY_R, KEY_RIGHT, KEY_SELECT, KEY_START, KEY_UP,
+    poll_keys, set_key_logging, GbaButton, InputPoller, KeyState, RawModeGuard, TerminalInput,
+    KEY_A, KEY_B, KEY_DOWN, KEY_L, KEY_LEFT, KEY_QUIT, KEY_R, KEY_RIGHT, KEY_SELECT, KEY_START,
+    KEY_UP,
 };
 
 /// Errors returned by the integrated emulation loop.

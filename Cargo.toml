@@ -30,6 +30,11 @@ name = "termgba"
 path = "src/main.rs"
 required-features = ["mgba"]
 
+[[bin]]
+name = "termgba-control"
+path = "src/bin/termgba-control.rs"
+required-features = ["mgba"]
+
 [[example]]
 name = "test_input"
 path = "examples/test_input.rs"
